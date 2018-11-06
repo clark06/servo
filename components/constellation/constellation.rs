@@ -155,6 +155,11 @@ use timer_scheduler::TimerScheduler;
 use webrender_api;
 use webvr_traits::{WebVREvent, WebVRMsg};
 
+
+type PendingApprovalNavigations = HashMap<
+    (TopLevelBrowsingContextId, PipelineId, ServoUrl), VecDeque<(LoadData, bool, Option<IpcSender<webdriver_msg::LoadStatus>>)>
+>;
+
 /// Servo supports tabs (referred to as browsers), so `Constellation` needs to
 /// store browser specific data for bookkeeping.
 struct Browser {
@@ -341,6 +346,9 @@ pub struct Constellation<Message, LTF, STF> {
 
     /// A channel through which messages can be sent to the canvas paint thread.
     canvas_chan: IpcSender<CanvasMsg>,
+
+    /// Navigation requests from script awaiting approval from the embedder.
+    pending_approval_navigations: PendingApprovalNavigations,
 }
 
 /// State needed to construct a constellation.
@@ -655,6 +663,7 @@ where
                     webgl_threads: state.webgl_threads,
                     webvr_chan: state.webvr_chan,
                     canvas_chan: CanvasPaintThread::start(),
+                    pending_approval_navigations: HashMap::new(),
                 };
 
                 constellation.run();
@@ -979,6 +988,51 @@ where
             FromCompositorMsg::Keyboard(key_event) => {
                 self.handle_key_msg(key_event);
             },
+            // Perform a navigation previously requested by script, if approved by the embedder.
+            // If there is already a pending page (self.pending_changes), it will not be overridden;
+            // However, if the id is not encompassed by another change, it will be.
+            FromCompositorMsg::AllowNavigation(top_level_browsing_context_id, pipeline_id, url, allowed) => {
+                if !allowed {
+                    return;
+                }
+                let key = (top_level_browsing_context_id, pipeline_id, url.clone());
+                let (load_data, replace, webdriver_reply) = {
+                    let pending = self
+                        .pending_approval_navigations
+                        .entry(key)
+                        .or_insert(VecDeque::new());
+                    match pending.pop_front() {
+                        Some((load_data, replace, webdriver_reply)) => {
+                            (load_data, replace, webdriver_reply)
+                        },
+                        None => {
+                            return warn!(
+                                "AllowNavigation for unknow request: {:?} {:?}",
+                                top_level_browsing_context_id,
+                                url
+                            )
+                        },
+                    }
+                };
+                match webdriver_reply {
+                    Some(reply) => {
+                        self.load_url_for_webdriver(
+                            top_level_browsing_context_id,
+                            load_data,
+                            reply,
+                            replace
+                        );
+                    },
+                    None => {
+                        self.load_url(
+                            top_level_browsing_context_id,
+                            pipeline_id,
+                            load_data,
+                            replace
+                        );
+                    },
+                };
+            },
             // Load a new page from a typed url
             // If there is already a pending page (self.pending_changes), it will not be overridden;
             // However, if the id is not encompassed by another change, it will be.
@@ -994,7 +1048,9 @@ where
                         )
                     },
                 };
-                self.handle_load_url_msg(
+                // Since this is a top-level load, initiated by the embedder, go straight to load_url,
+                // bypassing schedule_navigation.
+                self.load_url(
                     top_level_browsing_context_id,
                     pipeline_id,
                     load_data,
@@ -1111,11 +1167,15 @@ where
             FromScriptMsg::ChangeRunningAnimationsState(animation_state) => {
                 self.handle_change_running_animations_state(source_pipeline_id, animation_state)
             },
-            // Load a new page from a mouse click
-            // If there is already a pending page (self.pending_changes), it will not be overridden;
-            // However, if the id is not encompassed by another change, it will be.
+            // Ask the embedder for permission to load a new page.
             FromScriptMsg::LoadUrl(load_data, replace) => {
-                self.handle_load_url_msg(source_top_ctx_id, source_pipeline_id, load_data, replace);
+                self.schedule_navigation(
+                    source_top_ctx_id,
+                    source_pipeline_id,
+                    load_data,
+                    None,
+                    replace
+                );
             },
             FromScriptMsg::AbortLoadUrl => {
                 self.handle_abort_load_url_msg(source_pipeline_id);
@@ -2040,14 +2100,35 @@ where
         }
     }
 
-    fn handle_load_url_msg(
+    /// Schedule a navigation(via load_url).
+    /// 1: Ask the embedder for permission.
+    /// 2: Store the details of the navigation, pending approval from the embedder.
+    /// 3: In the case of an iframe being navigated, start the navigation via the corresponding event-loop.
+    fn schedule_navigation(
         &mut self,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
         source_id: PipelineId,
         load_data: LoadData,
+        webdriver: Option<IpcSender<webdriver_msg::LoadStatus>>,
         replace: bool,
     ) {
-        self.load_url(top_level_browsing_context_id, source_id, load_data, replace);
+        // Allow the embedder to handle the url itself
+        let msg = (
+            Some(top_level_browsing_context_id),
+            EmbedderMsg::AllowNavigation(source_id, load_data.url.clone()),
+        );
+        self.embedder_proxy.send(msg);
+        {
+            let key = (top_level_browsing_context_id,
+                source_id,
+                load_data.url.clone()
+            );
+            let pending = self
+                .pending_approval_navigations
+                .entry(key)
+                .or_insert(VecDeque::new());
+            pending.push_back((load_data.clone(), replace, webdriver));
+        }
     }
 
     fn load_url(
@@ -2057,17 +2138,6 @@ where
         load_data: LoadData,
         replace: bool,
     ) -> Option<PipelineId> {
-        // Allow the embedder to handle the url itself
-        let (chan, port) = ipc::channel().expect("Failed to create IPC channel!");
-        let msg = (
-            Some(top_level_browsing_context_id),
-            EmbedderMsg::AllowNavigation(load_data.url.clone(), chan),
-        );
-        self.embedder_proxy.send(msg);
-        if let Ok(false) = port.recv() {
-            return None;
-        }
-
         debug!("Loading {} in pipeline {}.", load_data.url, source_id);
         // If this load targets an iframe, its framing element may exist
         // in a separate script thread than the framed document that initiated
@@ -2098,8 +2168,7 @@ where
                     // against future changes that might break things.
                     warn!(
                         "Pipeline {} loaded url in closed browsing context {}.",
-                        source_id,
-                        browsing_context_id,
+                        source_id, browsing_context_id,
                     );
                     return None;
                 },
@@ -2926,7 +2995,23 @@ where
                 ));
             },
             WebDriverCommandMsg::LoadUrl(top_level_browsing_context_id, load_data, reply) => {
-                self.load_url_for_webdriver(top_level_browsing_context_id, load_data, reply, false);
+                let browsing_context_id = BrowsingContextId::from(top_level_browsing_context_id);
+                let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
+                    Some(browsing_context) => browsing_context.pipeline_id,
+                    None => {
+                        return warn!(
+                            "Browsing context {} Refresh after closure.",
+                            browsing_context_id
+                        )
+                    },
+                };
+                self.schedule_navigation(
+                    top_level_browsing_context_id,
+                    pipeline_id,
+                    load_data,
+                    Some(reply),
+                    false
+                );
             },
             WebDriverCommandMsg::Refresh(top_level_browsing_context_id, reply) => {
                 let browsing_context_id = BrowsingContextId::from(top_level_browsing_context_id);
@@ -2943,7 +3028,13 @@ where
                     Some(pipeline) => pipeline.load_data.clone(),
                     None => return warn!("Pipeline {} refresh after closure.", pipeline_id),
                 };
-                self.load_url_for_webdriver(top_level_browsing_context_id, load_data, reply, true);
+                self.schedule_navigation(
+                    top_level_browsing_context_id,
+                    pipeline_id,
+                    load_data,
+                    Some(reply),
+                    true
+                )
             },
             WebDriverCommandMsg::ScriptCommand(browsing_context_id, cmd) => {
                 let pipeline_id = match self.browsing_contexts.get(&browsing_context_id) {
