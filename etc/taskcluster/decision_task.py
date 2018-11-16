@@ -11,9 +11,17 @@ from decisionlib import *
 def main(task_for, mock=False):
     if task_for == "github-push":
         if CONFIG.git_ref in ["refs/heads/auto", "refs/heads/try", "refs/heads/try-taskcluster"]:
-            linux_tidy_unit()
-            android_arm32()
-            windows_dev()
+            branch = CONFIG.git_ref.split("/")[-1]
+            assert CONFIG.git_sha
+            route = ".v2.servo/servo-%s.%s" % (branch, CONFIG.git_sha)
+            CONFIG.routes_for_all_subtasks.extend([
+                "tc-treeherder" + route,
+                "tc-treeherder-staging" + route,
+            ])
+
+            # linux_tidy_unit()
+            # android_arm32()
+            # windows_dev()
             if mock:
                 windows_release()
                 linux_wpt()
